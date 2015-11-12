@@ -1,0 +1,95 @@
+#!/System/Library/Frameworks/Ruby.framework/Versions/Current/usr/bin/ruby
+
+CHEF_FILENAME='chef-12.5.1-1.dmg'
+# FIXME: support more than OSX 10.11
+CHEF_REMOTE="https://opscode-omnibus-packages.s3.amazonaws.com/mac_os_x/10.11/x86_64/#{CHEF_FILENAME}"
+CHEF_SUM='4b4023ffeca85ec5d456ad2f0956d91ff0028655'
+
+BOOTSTRAP_FILENAME='oskar.tar.gz'
+BOOTSTRAP_REMOTE='https://github.com/pcarrier/oskar/archive/master.tar.gz'
+CLONE_URL='git@github.com:pcarrier/oskar.git'
+
+class ExecFailed < StandardError; end
+
+def log msg
+  STDERR.puts "= #{msg} ="
+end
+
+def bork msg
+  log "OOPS! OOPS! OOPS! #{msg}"
+  exit 1
+end
+
+def run *args
+  STDERR.puts "+ #{args.join ' '}"
+  pid = fork { exec *args }
+  Process.wait pid
+  unless $?.success?
+    raise ExecFailed, $?
+  end
+end
+
+bork 'Do not run as root!' if ENV['USER'] == 'root'
+
+unless File.exists? '/usr/local/bin'
+  log 'Creating /usr/local/bin'
+  run 'sudo mkdir -p /usr/local/bin'
+  run 'sudo chown root:admin /usr/local /usr/local/bin'
+end
+
+def fixperms path
+  unless File.stat(path).mode == 040775
+    log "Fixing permissions on #{path}"
+    run "sudo chmod 40775 #{path}"
+  end
+end
+
+fixperms '/usr/local'
+fixperms '/usr/local/bin'
+
+unless File.exists? '/opt/chef/bin/chef-solo'
+  log 'Installing Chef'
+  Dir.chdir '/usr/local'
+  run "curl --fail -o #{CHEF_FILENAME} #{CHEF_REMOTE}"
+
+  unless `openssl sha1 < #{CHEF_FILENAME}`.strip =~ /#{CHEF_SUM}$/
+  	bork 'Invalid SHA1 for Chef archive!'
+  end
+  run 'sudo mkdir -p /opt'
+  run "sudo tar xjf #{CHEF_FILENAME} -C /opt"
+  File.delete CHEF_FILENAME
+end
+
+def git_clone
+  log 'Cloning oskar git repository'
+  run "git clone #{CLONE_URL} /usr/local/oskar"
+end
+
+unless File.exists? '/usr/local/oskar'
+  if File.exists? '/usr/local/bin/git'
+    git_clone
+  else
+    log 'Downloading oskar'
+    Dir.chdir '/usr/local'
+    run "curl --fail --location -o #{BOOTSTRAP_FILENAME} #{BOOTSTRAP_REMOTE}"
+    Dir.mkdir 'oskar'
+    run "tar xzf #{BOOTSTRAP_FILENAME} --strip-components 1 -C oskar"
+    File.delete BOOTSTRAP_FILENAME
+  end
+end
+
+unless File.exists? '/usr/local/oskar/.git'
+  if File.exists? '/usr/local/bin/git'
+    Dir.chdir '/usr/local'
+    run 'sudo rm -r /usr/local/oskar'
+    git_clone
+    Dir.chdir '/usr/local/oskar'
+  end
+end
+
+unless File.exists? '/usr/local/bin/oskar'
+  log 'Linking oskar CLI'
+  File.symlink '/usr/local/oskar/oskar', '/usr/local/bin/oskar'
+end
+
+log 'All Good! Have fun!'

@@ -1,0 +1,152 @@
+#!/System/Library/Frameworks/Ruby.framework/Versions/Current/usr/bin/ruby
+
+require 'etc'
+require 'fileutils'
+require 'socket'
+
+class ExecFailed < StandardError; end
+
+HOME = '/usr/local/oskar'
+USER = Etc.getlogin
+EDITOR = ENV['EDITOR'] || 'vim'
+USER_RECIPE_TEMPLATE = 'chef/cookbooks/user/recipe_templates/user.rb'
+DOC_URL = 'https://github.com/pcarrier/oskar/blob/master/README.md'
+GITHUB_URL = 'https://github.com/pcarrier/oskar'
+STATSD_HOST = 'statsd.example.com'
+
+def test_freshness
+  begin
+    age = Time.now - File.stat(File.readlink($0)).mtime
+    days_old = age / (24 * 3600)
+    if days_old > 1
+      STDERR.puts <<-EOS
+***
+*** oskar has not been updated in #{days_old.to_i} days!
+*** Please consider running `oskar update`
+***
+EOS
+    end
+  rescue StandardError => e
+    log e
+  end
+end
+
+def count name, value = 1
+  msg = "oskar.#{name.gsub(/[^a-z.]+/, '_')}.#{USER}:#{value}|c"
+  begin
+    UDPSocket.new.send msg, 0, STATSD_HOST, 8125
+  rescue SocketError
+    # too bad, moving on :)
+  end
+end
+
+def help
+  STDERR.puts <<-EOS
+oskar is documented on #{DOC_URL}
+Use oskar openhelp to open it in your browser.
+EOS
+end
+
+def fail
+  help
+  count 'fail'
+  exit 1
+end
+
+def log msg
+  STDERR.puts "== #{msg} =="
+end
+
+def run *args
+  descr = args.join ' '
+  log "Running #{descr}"
+  pid = fork { exec *args }
+  Process.wait pid
+  unless $?.success?
+    count "fail.#{descr}"
+    raise ExecFailed, $?
+  end
+end
+
+def update
+  run '/usr/local/bin/git pull --rebase'
+  t = Time.now
+  File.utime t, t, $0 # track we've updated
+  run '/usr/local/bin/brew update' if File.exists? '/usr/local/bin/brew'
+end
+
+def upgrade
+  update
+  if File.exists? '/usr/local/bin/brew'
+    run 'brew upgrade'
+    run 'brew cleanup'
+  end
+end
+
+def cleanup
+  if File.exists? '/usr/local/bin/brew'
+    run 'brew cleanup'
+  end
+  if File.exists? '/var/chef/cache'
+    run 'sudo rm -fr /var/chef/cache'
+  end
+end
+
+def converge *args
+  case args.shift
+  when 'debug'
+    count 'converge.debug'
+    count 'debug'
+    run 'sudo /opt/chef/bin/chef-solo --config chef/config.rb --json-attributes chef/attributes.json --log_level debug'
+  when 'info'
+    count 'converge.info'
+    run 'sudo /opt/chef/bin/chef-solo --config chef/config.rb --json-attributes chef/attributes.json --log_level info'
+  when nil
+    count 'converge.default'
+    run 'sudo /opt/chef/bin/chef-solo --config chef/config.rb --json-attributes chef/attributes.json'
+  else
+    fail
+  end
+end
+
+def edit *args
+  case args.shift
+  when 'user'
+    user = args.shift || USER
+    path = "chef/cookbooks/user/recipes/#{user}.rb"
+    unless ::File.exists? path
+      ::FileUtils.copy USER_RECIPE_TEMPLATE, path
+      run 'git', 'add', path
+    end
+    run EDITOR, path
+  when nil
+    edit 'user'
+  else fail
+  end
+end
+
+def main args
+  unless %w[update upgrade].include? args.first
+    test_freshness
+  end
+
+  run './bootstrap'
+
+  case args.shift
+  when 'update'   then update
+  when 'upgrade'  then upgrade
+  when 'cleanup'  then cleanup
+  when 'converge' then converge *args
+  when 'edit'     then edit *args
+  when 'github'   then run 'open', GITHUB_URL
+  when 'openhelp' then run 'open', DOC_URL
+  when 'open'     then run *(%w[open] + (args.empty? ? %w[.] : args))
+  when 'git'      then run *(%w[git] + args)
+  when '-h', '--help', 'help', nil then help
+  else fail
+  end
+end
+
+Dir.chdir HOME do
+  main ARGV
+end
